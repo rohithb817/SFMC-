@@ -1,29 +1,24 @@
 %%[
 /* ============================================================
-   Inbound SMS Handler — HELP Keyword Auto-Reply
+   Inbound SMS Handler — Capture All & Reply
    ============================================================
-   Purpose : Detect inbound HELP messages, send the required
-             compliance response, and route all other keywords
-             to the 2-Way SMS CloudPage for processing.
+   Purpose : Capture every inbound SMS message, classify it by
+             keyword, send an appropriate reply, and log it.
    Context : MobileConnect Inbound Message Auto-Reply
    ============================================================ */
 
-VAR @phone, @shortcode, @guid_smsid, @messageText, @cleanKeyword
-VAR @isHelp, @helpMessage, @url
-VAR @nowUTC, @localdate, @MemberID, @subscriberKey
+VAR @phone, @shortcode, @guid_smsid
+VAR @messageText, @cleanKeyword, @replyMessage, @keywordType
+VAR @url, @nowUTC, @localdate, @MemberID, @subscriberKey
 
 /* ---- 1. Capture system values ---- */
 SET @phone      = MOBILE_NUMBER
 SET @shortcode  = SHORT_CODE
 SET @guid_smsid = GUID()
 
-/* ---- 2. Get inbound message text ---- */
-/* MSG(0).VERB returns the full inbound message body in
-   a MobileConnect auto-reply context.                    */
+/* ---- 2. Capture the inbound message ---- */
 SET @messageText = MSG(0).VERB
 
-/* Fallback: if MSG() is unavailable (e.g. CloudPage context),
-   try the MO keyword attribute passed by SFMC              */
 IF EMPTY(@messageText) THEN
   SET @messageText = AttributeValue("MO_BODY")
 ENDIF
@@ -36,76 +31,107 @@ IF EMPTY(@messageText) THEN
   SET @messageText = "UNKNOWN"
 ENDIF
 
-/* ---- 3. Normalize the message ---- */
+/* ---- 3. Normalize ---- */
 SET @messageText = UPPERCASE(TRIM(@messageText))
 
-/* Strip common punctuation/spaces for keyword matching */
 SET @cleanKeyword = Replace(@messageText, " ", "")
 SET @cleanKeyword = Replace(@cleanKeyword, "!", "")
 SET @cleanKeyword = Replace(@cleanKeyword, ".", "")
 SET @cleanKeyword = Replace(@cleanKeyword, "?", "")
 SET @cleanKeyword = Replace(@cleanKeyword, "*", "")
 
-/* ---- 4. Detect HELP keyword (exact match only) ---- */
-SET @isHelp = 0
-SET @helpMessage = ""
+/* ---- 4. Classify keyword and build reply ---- */
+SET @replyMessage = ""
+SET @keywordType  = "GENERAL"
 
-/* Exact match — only the word HELP (with optional punctuation)
-   triggers the compliance response. This avoids false positives
-   from words like "HELPFUL" or "HELPING".                     */
+/* --- HELP --- */
 IF @cleanKeyword == "HELP" THEN
-  SET @isHelp = 1
-  SET @helpMessage = "NFCU Visit: For info, go to navyfederal.org/contact-us or call 888-842-6328. Msg Frequency May Vary-Msg & Data Rates May Apply-Txt STOP to opt out."
+  SET @keywordType  = "HELP"
+  SET @replyMessage = "NFCU Visit: For info, go to navyfederal.org/contact-us or call 888-842-6328. Msg Frequency May Vary-Msg & Data Rates May Apply-Txt STOP to opt out."
+
+/* --- STOP / OPT-OUT (TCPA compliance) --- */
+ELSEIF @cleanKeyword == "STOP" OR @cleanKeyword == "QUIT" OR @cleanKeyword == "END" OR @cleanKeyword == "CANCEL" OR @cleanKeyword == "UNSUBSCRIBE" THEN
+  SET @keywordType  = "OPTOUT"
+  SET @replyMessage = "NFCU: You have been unsubscribed and will no longer receive messages. Reply HELP for help or contact navyfederal.org/contact-us."
+
+/* --- START / OPT-IN --- */
+ELSEIF @cleanKeyword == "START" OR @cleanKeyword == "YES" OR @cleanKeyword == "SUBSCRIBE" OR @cleanKeyword == "OPTIN" THEN
+  SET @keywordType  = "OPTIN"
+  SET @replyMessage = "NFCU: You are now subscribed to receive messages from Navy Federal Credit Union. Msg Frequency May Vary-Msg & Data Rates May Apply-Txt STOP to opt out, HELP for help."
+
+/* --- BALANCE --- */
+ELSEIF @cleanKeyword == "BALANCE" OR @cleanKeyword == "BAL" THEN
+  SET @keywordType  = "BALANCE"
+  SET @replyMessage = "NFCU: To check your balance, log in to navyfederal.org or the Navy Federal app. For assistance, call 888-842-6328."
+
+/* --- LOAN / RATE --- */
+ELSEIF @cleanKeyword == "LOAN" OR @cleanKeyword == "LOANS" OR @cleanKeyword == "RATE" OR @cleanKeyword == "RATES" THEN
+  SET @keywordType  = "LOAN"
+  SET @replyMessage = "NFCU: For current loan rates and info, visit navyfederal.org/loans or call 888-842-6328. Msg & Data Rates May Apply-Txt STOP to opt out."
+
+/* --- BRANCH / LOCATION --- */
+ELSEIF @cleanKeyword == "BRANCH" OR @cleanKeyword == "LOCATION" OR @cleanKeyword == "ATM" THEN
+  SET @keywordType  = "BRANCH"
+  SET @replyMessage = "NFCU: Find a branch or ATM near you at navyfederal.org/branches. For help, call 888-842-6328. Txt STOP to opt out."
+
+/* --- INFO --- */
+ELSEIF @cleanKeyword == "INFO" OR @cleanKeyword == "INFORMATION" THEN
+  SET @keywordType  = "INFO"
+  SET @replyMessage = "NFCU: For more information about our products and services, visit navyfederal.org or call 888-842-6328. Txt STOP to opt out, HELP for help."
+
+/* --- DEFAULT: catch-all for any other inbound message --- */
+ELSE
+  SET @keywordType  = "GENERAL"
+  SET @replyMessage = Concat("NFCU: We received your message '", @messageText, "'. For assistance, visit navyfederal.org/contact-us or call 888-842-6328. Txt STOP to opt out, HELP for help.")
 ENDIF
 
 /* ---- 5. Build routing URL ---- */
-IF @isHelp == 1 THEN
-  /* Route HELP to the Inbound Help CloudPage */
+IF @keywordType == "HELP" THEN
   SET @url = Concat(
     "https://cloud.email.navyfederal.org/Inbound_CloudPage_Help",
     "?m=", @phone,
     "&s=", @shortcode,
     "&k=", @messageText,
-    "&g=", @guid_smsid
+    "&g=", @guid_smsid,
+    "&t=", @keywordType
   )
 ELSE
-  /* Route all other keywords to the 2-Way SMS CloudPage */
   SET @url = Concat(
     "https://cloud.email.navyfederal.org/TwoWay_SMS",
     "?m=", @phone,
     "&s=", @shortcode,
     "&k=", @messageText,
-    "&g=", @guid_smsid
+    "&g=", @guid_smsid,
+    "&t=", @keywordType
   )
 ENDIF
 
 ]%%
 
-%%[ /* ---- 6. Send SMS reply (only for HELP) ---- */ ]%%
-%%[ IF @isHelp == 1 THEN ]%%
-%%=v(@helpMessage)=%%
-%%[ ENDIF ]%%
+%%[ /* ---- 6. Reply to EVERY inbound message ---- */ ]%%
+%%=v(@replyMessage)=%%
 
 %%[
 /* ---- 7. Route to CloudPage for further processing ---- */
 SET @httpResult = HTTPGet(@url)
 
-/* ---- 8. Log the inbound message ---- */
-SET @nowUTC      = Now(1)
-SET @localdate   = SystemDateToLocalDate(@nowUTC)
-SET @MemberID    = AuthenticatedMemberID()
+/* ---- 8. Log the inbound message and reply ---- */
+SET @nowUTC        = Now(1)
+SET @localdate     = SystemDateToLocalDate(@nowUTC)
+SET @MemberID      = AuthenticatedMemberID()
 SET @subscriberKey = @phone
 
 InsertData(
   "ENT.InBoundMsgLog_INTG",
-  "MobileNumber",   @phone,
-  "message",        IIF(@isHelp == 1, "HELP_RESPONSE_SENT", "ROUTED_TO_TWOWAY"),
+  "MobileNumber",    @phone,
+  "message",         @replyMessage,
   "CreatedDateTime", @localdate,
-  "Shortcode",      @shortcode,
-  "MID",            @MemberID,
-  "Keyword",        @messageText,
-  "SubscriberKey",  @subscriberKey,
-  "MessageKey",     @guid_smsid
+  "Shortcode",       @shortcode,
+  "MID",             @MemberID,
+  "Keyword",         @messageText,
+  "KeywordType",     @keywordType,
+  "SubscriberKey",   @subscriberKey,
+  "MessageKey",      @guid_smsid
 )
 
 ]%%
