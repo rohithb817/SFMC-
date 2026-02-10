@@ -1,0 +1,111 @@
+%%[
+/* ============================================================
+   Inbound SMS Handler — HELP Keyword Auto-Reply
+   ============================================================
+   Purpose : Detect inbound HELP messages, send the required
+             compliance response, and route all other keywords
+             to the 2-Way SMS CloudPage for processing.
+   Context : MobileConnect Inbound Message Auto-Reply
+   ============================================================ */
+
+VAR @phone, @shortcode, @guid_smsid, @messageText, @cleanKeyword
+VAR @isHelp, @helpMessage, @url
+VAR @nowUTC, @localdate, @MemberID, @subscriberKey
+
+/* ---- 1. Capture system values ---- */
+SET @phone      = MOBILE_NUMBER
+SET @shortcode  = SHORT_CODE
+SET @guid_smsid = GUID()
+
+/* ---- 2. Get inbound message text ---- */
+/* MSG(0).VERB returns the full inbound message body in
+   a MobileConnect auto-reply context.                    */
+SET @messageText = MSG(0).VERB
+
+/* Fallback: if MSG() is unavailable (e.g. CloudPage context),
+   try the MO keyword attribute passed by SFMC              */
+IF EMPTY(@messageText) THEN
+  SET @messageText = AttributeValue("MO_BODY")
+ENDIF
+
+IF EMPTY(@messageText) THEN
+  SET @messageText = AttributeValue("Keyword")
+ENDIF
+
+IF EMPTY(@messageText) THEN
+  SET @messageText = "UNKNOWN"
+ENDIF
+
+/* ---- 3. Normalize the message ---- */
+SET @messageText = UPPERCASE(TRIM(@messageText))
+
+/* Strip common punctuation/spaces for keyword matching */
+SET @cleanKeyword = Replace(@messageText, " ", "")
+SET @cleanKeyword = Replace(@cleanKeyword, "!", "")
+SET @cleanKeyword = Replace(@cleanKeyword, ".", "")
+SET @cleanKeyword = Replace(@cleanKeyword, "?", "")
+SET @cleanKeyword = Replace(@cleanKeyword, "*", "")
+
+/* ---- 4. Detect HELP keyword (exact match only) ---- */
+SET @isHelp = 0
+SET @helpMessage = ""
+
+/* Exact match — only the word HELP (with optional punctuation)
+   triggers the compliance response. This avoids false positives
+   from words like "HELPFUL" or "HELPING".                     */
+IF @cleanKeyword == "HELP" THEN
+  SET @isHelp = 1
+  SET @helpMessage = "NFCU Visit: For info, go to navyfederal.org/contact-us or call 888-842-6328. Msg Frequency May Vary-Msg & Data Rates May Apply-Txt STOP to opt out."
+ENDIF
+
+/* ---- 5. Build routing URL ---- */
+IF @isHelp == 1 THEN
+  /* Route HELP to the Inbound Help CloudPage */
+  SET @url = Concat(
+    "https://cloud.email.navyfederal.org/Inbound_CloudPage_Help",
+    "?m=", @phone,
+    "&s=", @shortcode,
+    "&k=", @messageText,
+    "&g=", @guid_smsid
+  )
+ELSE
+  /* Route all other keywords to the 2-Way SMS CloudPage */
+  SET @url = Concat(
+    "https://cloud.email.navyfederal.org/TwoWay_SMS",
+    "?m=", @phone,
+    "&s=", @shortcode,
+    "&k=", @messageText,
+    "&g=", @guid_smsid
+  )
+ENDIF
+
+]%%
+
+%%[ /* ---- 6. Send SMS reply (only for HELP) ---- */ ]%%
+%%[ IF @isHelp == 1 THEN ]%%
+%%=v(@helpMessage)=%%
+%%[ ENDIF ]%%
+
+%%[
+/* ---- 7. Route to CloudPage for further processing ---- */
+SET @httpResult = HTTPGet(@url)
+
+/* ---- 8. Log the inbound message ---- */
+SET @nowUTC      = Now(1)
+SET @localdate   = SystemDateToLocalDate(@nowUTC)
+SET @MemberID    = AuthenticatedMemberID()
+SET @subscriberKey = @phone
+
+InsertData(
+  "ENT.InBoundMsgLog_INTG",
+  "MobileNumber",   @phone,
+  "message",        IIF(@isHelp == 1, "HELP_RESPONSE_SENT", "ROUTED_TO_TWOWAY"),
+  "CreatedDateTime", @localdate,
+  "Shortcode",      @shortcode,
+  "MID",            @MemberID,
+  "Keyword",        @messageText,
+  "SubscriberKey",  @subscriberKey,
+  "MessageKey",     @guid_smsid
+)
+
+]%%
